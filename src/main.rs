@@ -24,8 +24,8 @@ fn main() {
         }
     }
 
-    // 3 frames completos: 3 × 70.224 ciclos = ~210.672 ciclos
-    let max_cycles: u64 = 70_224 * 3;
+    // 10 frames completos: 10 × 70.224 ciclos = ~702.240 ciclos
+    let max_cycles: u64 = 70_224 * 10;
     let mut total_cycles: u64 = 0;
     let mut total_steps:  u64 = 0;
 

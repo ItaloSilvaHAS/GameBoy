@@ -855,12 +855,144 @@ impl Cpu {
             // -----------------------------------------------------------------
             // PREFIXO CB — instruções de bit (shift, rotate, test)
             // Cada instrução CB tem o sub-opcode no byte seguinte.
-            // Implementaremos este bloco em seguida.
+            // -----------------------------------------------------------------
+            // PREFIXO CB — 256 sub-opcodes de manipulação de bits
+            //
+            // Estrutura do sub-opcode:
+            //   Bits 7-6 = categoria:  00=rotate/shift  01=BIT  10=RES  11=SET
+            //   Bits 5-3 = operação (rotate/shift) OU número do bit (BIT/RES/SET)
+            //   Bits 2-0 = registrador (0=B 1=C 2=D 3=E 4=H 5=L 6=(HL) 7=A)
             // -----------------------------------------------------------------
             0xCB => {
                 let sub_op = self.fetch_byte(bus);
-                log!("  PREFIX CB {:#04X}  (não implementado ainda)", sub_op);
-                8
+                let reg    = sub_op & 0x07;               // qual registrador
+                let op     = (sub_op >> 3) & 0x07;        // qual operação / bit
+                let cat    = (sub_op >> 6) & 0x03;        // categoria
+
+                // (HL) custa 4 ciclos extras de leitura/escrita
+                let base_cycles: u32 = if reg == 6 { 16 } else { 8 };
+
+                match cat {
+                    // =========================================================
+                    // CATEGORIA 00: Rotações e Shifts
+                    // =========================================================
+                    0x00 => {
+                        let val = self.read_r8(reg, bus);
+                        let result = match op {
+                            // RLC r — rotaciona para a esquerda; bit 7 → Carry e bit 0
+                            0 => {
+                                let c = val >> 7;
+                                let r = (val << 1) | c;
+                                self.f.carry = c != 0;
+                                log!("  RLC {}", Self::r8_name(reg));
+                                r
+                            }
+                            // RRC r — rotaciona para a direita; bit 0 → Carry e bit 7
+                            1 => {
+                                let c = val & 0x01;
+                                let r = (val >> 1) | (c << 7);
+                                self.f.carry = c != 0;
+                                log!("  RRC {}", Self::r8_name(reg));
+                                r
+                            }
+                            // RL r — rotaciona para a esquerda através do Carry
+                            2 => {
+                                let old_carry = self.f.carry as u8;
+                                let new_carry = val >> 7;
+                                let r = (val << 1) | old_carry;
+                                self.f.carry = new_carry != 0;
+                                log!("  RL {}", Self::r8_name(reg));
+                                r
+                            }
+                            // RR r — rotaciona para a direita através do Carry
+                            3 => {
+                                let old_carry = self.f.carry as u8;
+                                let new_carry = val & 0x01;
+                                let r = (val >> 1) | (old_carry << 7);
+                                self.f.carry = new_carry != 0;
+                                log!("  RR {}", Self::r8_name(reg));
+                                r
+                            }
+                            // SLA r — shift aritmético para a esquerda; bit 7 → Carry, bit 0 = 0
+                            4 => {
+                                self.f.carry = (val & 0x80) != 0;
+                                let r = val << 1;
+                                log!("  SLA {}", Self::r8_name(reg));
+                                r
+                            }
+                            // SRA r — shift aritmético para a direita; bit 0 → Carry, bit 7 preservado
+                            5 => {
+                                self.f.carry = (val & 0x01) != 0;
+                                let r = (val >> 1) | (val & 0x80); // mantém o bit de sinal
+                                log!("  SRA {}", Self::r8_name(reg));
+                                r
+                            }
+                            // SWAP r — troca o nibble alto com o nibble baixo
+                            6 => {
+                                let r = (val >> 4) | (val << 4);
+                                self.f.carry      = false;
+                                self.f.half_carry = false;
+                                log!("  SWAP {}", Self::r8_name(reg));
+                                r
+                            }
+                            // SRL r — shift lógico para a direita; bit 0 → Carry, bit 7 = 0
+                            7 => {
+                                self.f.carry = (val & 0x01) != 0;
+                                let r = val >> 1;
+                                log!("  SRL {}", Self::r8_name(reg));
+                                r
+                            }
+                            _ => unreachable!(),
+                        };
+                        // Flags comuns a todas as rotações/shifts (exceto carry, já setado acima)
+                        self.f.zero       = result == 0;
+                        self.f.subtract   = false;
+                        self.f.half_carry = false; // SWAP já setou, as demais: 0
+                        self.write_r8(reg, result, bus);
+                        base_cycles
+                    }
+
+                    // =========================================================
+                    // CATEGORIA 01: BIT b, r — testa o bit `op` do registrador
+                    // Seta Z se o bit for 0, reseta N, seta H. Não altera o reg.
+                    // =========================================================
+                    0x01 => {
+                        let val = self.read_r8(reg, bus);
+                        let bit = (val >> op) & 0x01;
+                        self.f.zero       = bit == 0;
+                        self.f.subtract   = false;
+                        self.f.half_carry = true;
+                        log!("  BIT {}, {}", op, Self::r8_name(reg));
+                        // BIT com (HL) custa 12 ciclos, não 16
+                        if reg == 6 { 12 } else { 8 }
+                    }
+
+                    // =========================================================
+                    // CATEGORIA 10: RES b, r — zera o bit `op` do registrador
+                    // Não afeta flags.
+                    // =========================================================
+                    0x02 => {
+                        let val    = self.read_r8(reg, bus);
+                        let result = val & !(1 << op);
+                        self.write_r8(reg, result, bus);
+                        log!("  RES {}, {}", op, Self::r8_name(reg));
+                        base_cycles
+                    }
+
+                    // =========================================================
+                    // CATEGORIA 11: SET b, r — seta o bit `op` do registrador
+                    // Não afeta flags.
+                    // =========================================================
+                    0x03 => {
+                        let val    = self.read_r8(reg, bus);
+                        let result = val | (1 << op);
+                        self.write_r8(reg, result, bus);
+                        log!("  SET {}, {}", op, Self::r8_name(reg));
+                        base_cycles
+                    }
+
+                    _ => unreachable!(),
+                }
             }
 
             // -----------------------------------------------------------------
