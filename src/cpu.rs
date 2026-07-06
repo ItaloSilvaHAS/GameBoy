@@ -37,15 +37,26 @@ impl Cpu {
             }
             0x06 => {
                 // LD B, d8 (Carrega um valor de 8 bits imediato no registrador B)
-                // O valor está no byte seguinte ao opcode, então lemos do endereço atual do PC
                 let value = bus.read(self.pc);
                 self.b = value;
                 self.pc += 1; // Avança o PC porque consumimos o valor
                 println!("-> Instrução: LD B, {} | Novo valor de B: {}", value, self.b);
             }
+            0xC3 => {
+                // JP nn (Jump para um endereço de 16 bits)
+                // O Game Boy armazena endereços em Little Endian (o byte menos significativo vem primeiro)
+                let low_byte = bus.read(self.pc) as u16;
+                let high_byte = bus.read(self.pc + 1) as u16;
+                
+                // Junta os dois bytes de 8 bits em um único endereço de 16 bits
+                let target_address = (high_byte << 8) | low_byte;
+
+                // Movemos o PC direto para o destino do pulo (consome os 2 bytes extras)
+                self.pc = target_address;
+                println!("-> Instrução: JP {:#06X} (Pulando para este endereço!)", target_address);
+            }
             _ => {
                 println!("-> Opcode desconhecido ou não implementado! Travando a CPU.");
-                // Em um emulador real, trataríamos isso. Aqui vamos só parar.
             }
         }
     }
