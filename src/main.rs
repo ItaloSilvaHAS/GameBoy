@@ -7,6 +7,7 @@ use bus::Bus;
 use cpu::Cpu;
 use cartridge::Cartridge;
 use minifb::{Key, Window, WindowOptions};
+use std::time::{Duration, Instant};
 
 // =============================================================================
 // CONSTANTES
@@ -139,9 +140,8 @@ fn main() {
         Err(e) => { eprintln!("Erro ao criar janela: {}", e); return; }
     };
 
-    // Limita a taxa de atualização ao clock real do DMG-01: ~59,73 fps
-    // 1 / 59,7275 Hz ≈ 16.742 µs por frame
-    window.limit_update_rate(Some(std::time::Duration::from_micros(16_742)));
+    // ~59,73 fps = 16.742 µs por frame
+    const FRAME_DURATION: Duration = Duration::from_micros(16_742);
 
     let mut pixel_buf = vec![0u32; WIN_W * WIN_H];
 
@@ -150,6 +150,8 @@ fn main() {
 
     // ── Game loop ─────────────────────────────────────────────────────────────
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        let frame_start = Instant::now();
+
         // 1. Lê teclado → atualiza joypad
         update_joypad(&window, &mut bus);
 
@@ -163,6 +165,12 @@ fn main() {
         window
             .update_with_buffer(&pixel_buf, WIN_W, WIN_H)
             .unwrap_or_else(|e| eprintln!("Erro ao atualizar janela: {}", e));
+
+        // 5. Throttle: dorme o tempo restante para manter ~59,73 fps
+        let elapsed = frame_start.elapsed();
+        if elapsed < FRAME_DURATION {
+            std::thread::sleep(FRAME_DURATION - elapsed);
+        }
     }
 
     println!("Encerrando emulador.");

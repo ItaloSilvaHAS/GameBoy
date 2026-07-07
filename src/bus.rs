@@ -241,7 +241,22 @@ impl Bus {
             0xFF06 => self.tma    = value,
             0xFF07 => self.tac    = value & 0x07,
             0xFF0F => self.if_reg = value,
-            0xFF40..=0xFF4B => self.ppu.write_register(addr, value),
+            // ── OAM DMA ($FF46) ───────────────────────────────────────────────
+        // O jogo escreve o byte alto do endereço fonte (ex: 0xC1 → copia
+        // de 0xC100). O hardware copia 160 bytes para 0xFE00–0xFE9F
+        // bloqueando o CPU por ~160 µs. Aqui fazemos a cópia instantânea,
+        // o que é suficiente para emulação.
+        0xFF46 => {
+            let base = (value as u16) << 8;
+            // Lê para buffer local antes de escrever (evita conflito de borrow)
+            let mut buf = [0u8; 160];
+            for i in 0u16..160 {
+                buf[i as usize] = self.read(base + i);
+            }
+            self.memory[0xFE00..0xFEA0].copy_from_slice(&buf);
+        }
+
+        0xFF40..=0xFF4B => self.ppu.write_register(addr, value),
             _ => {}
         }
     }

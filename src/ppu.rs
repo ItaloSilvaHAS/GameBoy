@@ -157,7 +157,7 @@ impl Ppu {
                         self.render_scanline(vram, oam);
                         // Incrementa linha da Window se ela foi desenhada nesta linha
                         if self.window_triggered {
-                            self.window_line += 1;
+                            self.window_line = self.window_line.saturating_add(1);
                         }
                         self.window_triggered = false;
                     }
@@ -381,6 +381,7 @@ impl Ppu {
     //   N  bytes  Pixel data   (BGR, 3 bytes/pixel, linhas de baixo para cima)
     //
     // 160 × 3 = 480 bytes por linha — já alinhado a 4 bytes, sem padding.
+    #[allow(dead_code)]
     pub fn save_bmp(&self, path: &str) -> std::io::Result<()> {
         // Paleta DMG-01 clássica: 4 tons de verde-cinza
         const PALETTE: [(u8, u8, u8); 4] = [
