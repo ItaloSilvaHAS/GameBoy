@@ -6,103 +6,164 @@ mod ppu;
 use bus::Bus;
 use cpu::Cpu;
 use cartridge::Cartridge;
+use minifb::{Key, Window, WindowOptions};
 
+// =============================================================================
+// CONSTANTES
+// =============================================================================
+const GB_W: usize = 160;
+const GB_H: usize = 144;
+const SCALE: usize = 3;                      // janela = 480 × 432
+const WIN_W: usize = GB_W * SCALE;
+const WIN_H: usize = GB_H * SCALE;
+const CYCLES_PER_FRAME: u64 = 70_224;
+
+// Paleta DMG-01 clássica em formato ARGB (0x00RRGGBB para minifb)
+const PALETTE: [u32; 4] = [
+    0x00E0F8D0, // 0 = branco-esverdeado
+    0x0088C070, // 1 = verde claro
+    0x00346856, // 2 = verde escuro
+    0x00081820, // 3 = quase preto
+];
+
+// =============================================================================
+// MAPEAMENTO DE TECLAS → BOTÕES DO GAME BOY
+// =============================================================================
+// D-pad  (bits 3-0 de joy.dpad):   Down=bit3, Up=bit2, Left=bit1, Right=bit0
+// Botões (bits 3-0 de joy.buttons): Start=bit3, Sel=bit2, B=bit1, A=bit0
+//
+// Teclado:
+//   Setas          → D-pad
+//   Z              → A
+//   X              → B
+//   Enter          → Start
+//   Backspace      → Select
+//   Escape         → Sair
+
+fn update_joypad(window: &Window, bus: &mut Bus) {
+    // D-pad: 0 = pressionado, começa com tudo solto (0x0F)
+    let mut dpad: u8 = 0x0F;
+    if window.is_key_down(Key::Right) { dpad &= !0x01; }
+    if window.is_key_down(Key::Left)  { dpad &= !0x02; }
+    if window.is_key_down(Key::Up)    { dpad &= !0x04; }
+    if window.is_key_down(Key::Down)  { dpad &= !0x08; }
+    bus.joy.dpad = dpad;
+
+    // Botões
+    let mut buttons: u8 = 0x0F;
+    if window.is_key_down(Key::Z)         { buttons &= !0x01; } // A
+    if window.is_key_down(Key::X)         { buttons &= !0x02; } // B
+    if window.is_key_down(Key::Backspace) { buttons &= !0x04; } // Select
+    if window.is_key_down(Key::Enter)     { buttons &= !0x08; } // Start
+    bus.joy.buttons = buttons;
+}
+
+// =============================================================================
+// CONVERTE framebuffer Game Boy (u8 shades 0-3) para buffer ARGB upscalado
+// =============================================================================
+fn blit_framebuffer(fb: &[u8; GB_W * GB_H], out: &mut Vec<u32>) {
+    for gy in 0..GB_H {
+        for gx in 0..GB_W {
+            let color = PALETTE[(fb[gy * GB_W + gx] & 3) as usize];
+            // Upscale SCALE×SCALE
+            for dy in 0..SCALE {
+                for dx in 0..SCALE {
+                    let idx = (gy * SCALE + dy) * WIN_W + (gx * SCALE + dx);
+                    out[idx] = color;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// LOOP PRINCIPAL — roda um frame completo (70.224 ciclos) por iteração de janela
+// =============================================================================
+fn run_frame(cpu: &mut Cpu, bus: &mut Bus) {
+    let mut frame_cycles: u64 = 0;
+
+    while frame_cycles < CYCLES_PER_FRAME {
+        // Despacha interrupções
+        let int_cyc = cpu.handle_interrupts(bus);
+        if int_cyc > 0 {
+            bus.tick(int_cyc);
+            frame_cycles += int_cyc as u64;
+            continue;
+        }
+
+        // HALT: aguarda interrupção
+        if cpu.halted {
+            bus.tick(4);
+            frame_cycles += 4;
+            continue;
+        }
+
+        // Executa instrução
+        let cycles = cpu.step(bus);
+        bus.tick(cycles);
+        frame_cycles += cycles as u64;
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
 fn main() {
     let mut bus = Bus::new();
     let mut cpu = Cpu::new();
+    cpu.verbose = false; // janela em tempo real — sem log no terminal
 
-    println!("--- INICIALIZANDO EMULADOR ---");
+    println!("--- GAME BOY DMG-01 ---");
 
     match Cartridge::load("teste.gb") {
         Ok(cartridge) => {
             bus.connect_cartridge(cartridge);
-            println!("Cartucho conectado. Iniciando em 0x0100.\n");
         }
         Err(e) => {
-            println!("Erro ao carregar ROM: {}", e);
+            eprintln!("Erro ao carregar ROM: {}", e);
             return;
         }
     }
 
-    // 60 frames (~4.2 milhões de ciclos) — o suficiente para o jogo terminar
-    // toda a inicialização e entrar no loop principal
-    let max_cycles: u64 = 70_224 * 60;
-    let mut total_cycles: u64 = 0;
-    let mut total_steps:  u64 = 0;
+    // ── Cria janela ───────────────────────────────────────────────────────────
+    let mut window = match Window::new(
+        "Game Boy — Pokémon Red  |  Z=A  X=B  Enter=Start  Backspace=Select  Setas=D-pad  Esc=Sair",
+        WIN_W,
+        WIN_H,
+        WindowOptions {
+            resize: false,
+            ..WindowOptions::default()
+        },
+    ) {
+        Ok(w)  => w,
+        Err(e) => { eprintln!("Erro ao criar janela: {}", e); return; }
+    };
 
-    // Detector de loop de polling silencioso
-    let mut last_unique_pc: u16 = 0xFFFF;
-    let mut repeat_count:   u32 = 0;
-    const QUIET_AFTER: u32 = 6;
+    // Limita a taxa de atualização ao clock real do DMG-01: ~59,73 fps
+    // 1 / 59,7275 Hz ≈ 16.742 µs por frame
+    window.limit_update_rate(Some(std::time::Duration::from_micros(16_742)));
 
-    while total_cycles < max_cycles {
-        // ── 1. Despacha interrupções pendentes (antes do fetch) ──────────────
-        let int_cycles = cpu.handle_interrupts(&mut bus);
-        if int_cycles > 0 {
-            bus.tick(int_cycles);
-            total_cycles += int_cycles as u64;
-            // Reseta detector de loop: saímos do contexto atual
-            repeat_count   = 0;
-            last_unique_pc = cpu.pc;
-            cpu.verbose    = true;
-            continue;
-        }
+    let mut pixel_buf = vec![0u32; WIN_W * WIN_H];
 
-        // ── 2. HALT: CPU dorme até próxima interrupção ───────────────────────
-        if cpu.halted {
-            // Avança 4 ciclos por vez enquanto aguarda
-            bus.tick(4);
-            total_cycles += 4;
-            continue;
-        }
+    println!("Janela aberta. Pressione Esc para sair.");
+    println!("Controles: Z=A  X=B  Enter=Start  Backspace=Select  Setas=D-pad");
 
-        // ── 3. Detecta loop de polling e controla verbosidade ─────────────────
-        let pc_before = cpu.pc;
-        if pc_before == last_unique_pc {
-            repeat_count += 1;
-            if repeat_count == QUIET_AFTER {
-                println!("  [loop de polling em PC={:#06X}, silenciando...]", pc_before);
-            }
-            cpu.verbose = repeat_count < QUIET_AFTER;
-        } else {
-            if repeat_count >= QUIET_AFTER {
-                println!("  [saiu do loop após {} iterações | LY={} | ciclos={}]",
-                    repeat_count, bus.ppu.ly, total_cycles);
-            }
-            repeat_count       = 0;
-            last_unique_pc     = pc_before;
-            cpu.verbose        = true;
-        }
+    // ── Game loop ─────────────────────────────────────────────────────────────
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        // 1. Lê teclado → atualiza joypad
+        update_joypad(&window, &mut bus);
 
-        // ── 4. Executa instrução ──────────────────────────────────────────────
-        let cycles = cpu.step(&mut bus);
-        bus.tick(cycles);
-        total_cycles += cycles as u64;
-        total_steps  += 1;
+        // 2. Roda um frame completo (70.224 ciclos de clock)
+        run_frame(&mut cpu, &mut bus);
 
-        // ── 5. Trava de segurança: opcode não implementado ────────────────────
-        if cpu.pc == pc_before && !cpu.halted {
-            cpu.verbose = true;
-            println!("\n=== TRAVADO: opcode não implementado em PC={:#06X} ===", pc_before);
-            println!("    Opcode: {:#04X}", bus.read(pc_before));
-            println!("    {} ciclos | {} instruções | LY={}",
-                total_cycles, total_steps, bus.ppu.ly);
-            println!("    A={:02X} BC={:02X}{:02X} DE={:02X}{:02X} HL={:02X}{:02X} SP={:#06X}",
-                cpu.a, cpu.b, cpu.c, cpu.d, cpu.e, cpu.h, cpu.l, cpu.sp);
-            println!("    Flags: Z={} N={} H={} C={}",
-                cpu.f.zero as u8, cpu.f.subtract as u8,
-                cpu.f.half_carry as u8, cpu.f.carry as u8);
-            break;
-        }
+        // 3. Converte e upscala o framebuffer para o buffer da janela
+        blit_framebuffer(&bus.ppu.framebuffer, &mut pixel_buf);
+
+        // 4. Apresenta na janela
+        window
+            .update_with_buffer(&pixel_buf, WIN_W, WIN_H)
+            .unwrap_or_else(|e| eprintln!("Erro ao atualizar janela: {}", e));
     }
 
-    if total_cycles >= max_cycles {
-        println!("\n=== {} frames concluídos ===", max_cycles / 70_224);
-        println!("    PC={:#06X} | LY={} | {} ciclos | {} instruções",
-            cpu.pc, bus.ppu.ly, total_cycles, total_steps);
-        println!("    A={:02X} BC={:02X}{:02X} DE={:02X}{:02X} HL={:02X}{:02X} SP={:#06X}",
-            cpu.a, cpu.b, cpu.c, cpu.d, cpu.e, cpu.h, cpu.l, cpu.sp);
-    }
-
-    println!("\n--- FIM ---");
+    println!("Encerrando emulador.");
 }
