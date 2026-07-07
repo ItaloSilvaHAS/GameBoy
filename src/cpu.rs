@@ -284,6 +284,64 @@ impl Cpu {
     }
 
     // =========================================================================
+    // DESPACHO DE INTERRUPÇÕES
+    // =========================================================================
+    // Chamado antes de cada fetch. Retorna true (e consome 20 ciclos) se uma
+    // interrupção foi atendida — nesse caso o step não deve executar instrução.
+    //
+    // Prioridade: VBlank > STAT > Timer > Serial > Joypad  (bit 0 > bit 4)
+    //
+    // Fluxo quando IME=1 e há interrupção pendente (IF & IE != 0):
+    //   1. IME = false  (desabilita novas interrupções)
+    //   2. Limpa o bit correspondente em IF
+    //   3. Push PC na pilha
+    //   4. PC = vetor da interrupção (0x0040 / 0x0048 / 0x0050 / 0x0058 / 0x0060)
+    //
+    // Quando IME=0 mas há pendente: só acorda do HALT (sem executar handler).
+    pub fn handle_interrupts(&mut self, bus: &mut Bus) -> u32 {
+        let pending = bus.ie_reg & bus.if_reg & 0x1F;
+        if pending == 0 { return 0; }
+
+        // Qualquer interrupção pendente acorda a CPU do HALT
+        if self.halted {
+            self.halted = false;
+        }
+
+        // Sem IME habilitado: a CPU acordou do HALT mas não executa o handler
+        if !self.ime { return 0; }
+
+        // Processa a interrupção de maior prioridade (bit mais baixo)
+        for bit in 0..5u8 {
+            if pending & (1 << bit) != 0 {
+                self.ime      = false;
+                self.ime_next = false;
+                bus.if_reg   &= !(1 << bit); // limpa o flag
+
+                let vector: u16 = match bit {
+                    0 => 0x0040, // VBlank
+                    1 => 0x0048, // LCD STAT
+                    2 => 0x0050, // Timer
+                    3 => 0x0058, // Serial
+                    4 => 0x0060, // Joypad
+                    _ => unreachable!(),
+                };
+
+                let pc = self.pc;
+                self.stack_push(bus, pc);
+                self.pc = vector;
+
+                if self.verbose {
+                    let name = ["VBlank","STAT","Timer","Serial","Joypad"][bit as usize];
+                    println!("  >>> INTERRUPT {} → {:#06X}", name, vector);
+                }
+
+                return 20; // despacho de interrupção custa 20 ciclos
+            }
+        }
+        0
+    }
+
+    // =========================================================================
     // CICLO PRINCIPAL: FETCH -> DECODE -> EXECUTE
     // Retorna o número de ciclos de clock consumidos pela instrução.
     // =========================================================================
